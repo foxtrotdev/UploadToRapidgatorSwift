@@ -21,8 +21,8 @@ struct ContentView: View {
     @State private var filesUploadResult: String? = nil
     @State private var postResult: String? = nil
     
-    @State private var uploadStatus: String? = nil // New state to track the upload status
-    
+    @State private var showCopyNotification: Bool = false
+
     private let credentials = CredentialsManager.shared
     
     enum ActionType {
@@ -46,6 +46,7 @@ struct ContentView: View {
                 
                 TextField("Cookie", text: $cookie)
                     .textFieldStyle(RoundedBorderTextFieldStyle())
+                    .disabled(true)
                 
                 TextField("Title", text: $title)
                     .textFieldStyle(RoundedBorderTextFieldStyle())
@@ -88,6 +89,7 @@ struct ContentView: View {
                                 .fontWeight(.bold)
                             Text(result)
                                 .foregroundColor(.green)
+                                .textSelection(.enabled)
                         }
                     }
                 }
@@ -147,14 +149,22 @@ struct ContentView: View {
                                 .fontWeight(.bold)
                             Text(uploadResult)
                                 .foregroundColor(.green)
+                                .textSelection(.enabled)
                         }
                     }
                 }
                 
                 if coverUploadResult != nil && filesUploadResult != nil {
                     if postResult == nil {
-                        Button("Post It") {
-                            // TODO...
+                        Button("Copy code") {
+                            copyBBCodeToClipboard()
+                        }
+                        .alert(isPresented: $showCopyNotification) {
+                            Alert(
+                                title: Text("Copied!"),
+                                message: Text("The BBCode has been copied to your clipboard."),
+                                dismissButton: .default(Text("OK"))
+                            )
                         }
                     } else if let result = postResult {
                         HStack {
@@ -170,6 +180,31 @@ struct ContentView: View {
             .padding()
             .frame(maxWidth: .infinity, minHeight: 700, maxHeight: .infinity, alignment: .top) // Align components to the top
         }
+    }
+    
+    private func copyBBCodeToClipboard() {
+        guard let coverURL = coverUploadResult else {
+            NSLog("Missing required coverUploadResult to copy.")
+            return
+        }
+        
+        guard let rapidgatorURL = filesUploadResult else {
+            NSLog("Missing required filesUploadResult to copy.")
+            return
+        }
+        
+        // Generate the BBCode
+        let bbCode = """
+        [img]\(coverURL)[/img]
+        [code]\(rapidgatorURL)[/code]
+        """
+        
+        // Copy the BBCode to the clipboard
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(bbCode, forType: .string)
+        
+        // Show notification
+        showCopyNotification = true
     }
     
     private func handleDrop(providers: [NSItemProvider], isCover: Bool) -> Bool {
@@ -191,36 +226,29 @@ struct ContentView: View {
         return true
     }
     
-    private func performAction(for uploadType: ActionType, completion: @escaping (Result<String, Error>) -> Void) {
+    private func performAction(for uploadType: ActionType, uiCompletion: @escaping (Result<String, Error>) -> Void) {
         switch uploadType {
         case .uploadCover(let filePath):
             uploadImage(filePath: filePath, apiKey: credentials.apiKey) { result in
                 DispatchQueue.main.async {
-                    completion(result)
+                    uiCompletion(result)
                 }
             }
         case .zipFiles(let filePaths):
             zipFiles(filePaths: filePaths) { result in
                 DispatchQueue.main.async {
-                    completion(result)
+                    uiCompletion(result)
                 }
             }
             
         case .uploadFile(let filePath):
-            completion(.success("Authenticating..."))
+            //uiCompletion(.success("Authenticating..."))
             authenticate(login: credentials.login, password: credentials.password) { authResult in
                 switch authResult {
                 case .success(let token):
-                    completion(.success("Uploading..."))
-                    uploadToRapidgator(filePath: filePath, token: token) { uploadResult in
-                        DispatchQueue.main.async {
-                            completion(uploadResult)
-                        }
-                    }
+                    performUpload(filePath: filePath, token: token, uiCompletion: uiCompletion)
                 case .failure(let error):
-                    DispatchQueue.main.async {
-                        completion(.failure(error))
-                    }
+                    uiCompletion(.failure(NSError(domain: "Authentication failed", code: -1, userInfo: nil)))
                 }
             }
         }
@@ -231,13 +259,23 @@ struct ContentView: View {
         dropCoverArea = nil
         dropFilesArea = []
         coverUploadResult = nil
+        filesZipResult = nil
         filesUploadResult = nil
         postResult = nil
     }
     
     func authenticate(login: String, password: String, completion: @escaping (Result<String, Error>) -> Void) {
-        let url = URL(string: "https://rapidgator.net/api/v2/user/login")!
-        var request = URLRequest(url: url)
+        NSLog("Authenticating...")
+        
+        let url = "https://rapidgator.net/api/v2/user/login"
+        
+        guard let requestURL = URL(string: url) else {
+            completion(.failure(NSError(domain: "InvalidURL", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid URL: \(url)"])))
+            return
+        }
+        
+        var request = URLRequest(url: requestURL)
+        
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         
@@ -248,7 +286,6 @@ struct ContentView: View {
         
         request.httpBody = try? JSONSerialization.data(withJSONObject: body, options: [])
         
-        NSLog("Fire: authenticate")
         let task = URLSession.shared.dataTask(with: request) { data, response, error in
             if let error = error {
                 completion(.failure(error))
@@ -275,40 +312,97 @@ struct ContentView: View {
         task.resume()
     }
     
-    func uploadToRapidgator(filePath: String, token: String, completion: @escaping (Result<String, Error>) -> Void) {
-        let url = URL(string: "https://rapidgator.net/api/v2/file/upload")!
+    func initiateUpload(fileName: String, fileSize: Int, fileHash: String, token: String, completion: @escaping (Result<(String?, String), Error>) -> Void) {
+        NSLog("Initiating upload...")
         
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
+        guard var urlComponents = URLComponents(string: "https://rapidgator.net/api/v2/file/upload") else {
+            completion(.failure(NSError(domain: "InvalidURL", code: -1, userInfo: nil)))
+            return
+        }
         
-        let boundary = UUID().uuidString
-        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        urlComponents.queryItems = [
+            URLQueryItem(name: "name", value: fileName),
+            URLQueryItem(name: "hash", value: fileHash),
+            URLQueryItem(name: "size", value: "\(fileSize)"),
+            URLQueryItem(name: "token", value: token)
+        ]
+        
+        guard let url = urlComponents.url else {
+            completion(.failure(NSError(domain: "InvalidURL", code: -1, userInfo: nil)))
+            return
+        }
+        
+        let task = URLSession.shared.dataTask(with: url) { data, response, error in
+            if let error = error {
+                completion(.failure(error))
+                return
+            }
+            
+            guard let data = data else {
+                completion(.failure(NSError(domain: "NoData", code: -1, userInfo: nil)))
+                return
+            }
+            
+            do {
+                guard let json = try JSONSerialization.jsonObject(with: data, options: []) as? [String: Any] else {
+                    completion(.failure(NSError(domain: "ParseError", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to parse response as JSON."])))
+                    return
+                }
+                
+                guard let response = json["response"] as? [String: Any],
+                      let upload = response["upload"] as? [String: Any] else {
+                    completion(.failure(NSError(domain: "ParseError", code: -1, userInfo: [NSLocalizedDescriptionKey: "Unexpected JSON structure."])))
+                    return
+                }
+                
+                if let state = upload["state"] as? Int {
+                    if state == 2,
+                       let file = upload["file"] as? [String: Any],
+                       let url = file["url"] as? String {
+                        // File already exists, returns final url
+                        completion(.success((nil, url)))
+                    } else if let uploadId = upload["upload_id"] as? String, let url = upload["url"] as? String {
+                        // File is ready for upload, returns upload url
+                        completion(.success((uploadId, url)))
+                    } else {
+                        completion(.failure(NSError(domain: "InvalidState", code: -1, userInfo: [NSLocalizedDescriptionKey: "Unexpected upload state: \(state)"])))
+                    }
+                } else {
+                    completion(.failure(NSError(domain: "ParseError", code: -1, userInfo: nil)))
+                }
+            } catch {
+                completion(.failure(error))
+            } catch {
+                completion(.failure(error))
+            }
+        }
+        
+        task.resume()
+    }
+    
+    func uploadFile(filePath: String, url: String, uploadId: String, completion: @escaping (Result<String, Error>) -> Void) {
+        NSLog("Uploading file...")
         
         guard let fileData = try? Data(contentsOf: URL(fileURLWithPath: filePath)) else {
             completion(.failure(NSError(domain: "FileError", code: -1, userInfo: [NSLocalizedDescriptionKey: "Cannot read file"])))
             return
         }
         
-        NSLog("filePath: %@", filePath)
-        let fileName = URL(fileURLWithPath: filePath).deletingPathExtension().lastPathComponent
-        NSLog("fileName: %@", fileName)
-        let fileSize = fileData.count
-        NSLog("fileSize: %d", fileSize)
-        let fileHash = md5(data: fileData)
-        NSLog("fileHash: %@", fileHash)
+        guard let requestURL = URL(string: url) else {
+            completion(.failure(NSError(domain: "InvalidURL", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid URL: \(url)"])))
+            return
+        }
+        
+        var request = URLRequest(url: requestURL)
+        request.httpMethod = "POST"
+        
+        let boundary = UUID().uuidString
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
         
         var body = Data()
         
         body.append("--\(boundary)\r\n".data(using: .utf8)!)
-        body.append("Content-Disposition: form-data; name=\"token\"\r\n\r\n\(token)\r\n".data(using: .utf8)!)
-        body.append("--\(boundary)\r\n".data(using: .utf8)!)
-        body.append("Content-Disposition: form-data; name=\"name\"\r\n\r\n\(fileName)\r\n".data(using: .utf8)!)
-        body.append("--\(boundary)\r\n".data(using: .utf8)!)
-        body.append("Content-Disposition: form-data; name=\"hash\"\r\n\r\n\(fileHash)\r\n".data(using: .utf8)!)
-        body.append("--\(boundary)\r\n".data(using: .utf8)!)
-        body.append("Content-Disposition: form-data; name=\"size\"\r\n\r\n\(fileSize)\r\n".data(using: .utf8)!)
-        body.append("--\(boundary)\r\n".data(using: .utf8)!)
-        body.append("Content-Disposition: form-data; name=\"file\"; filename=\"\(fileName)\"\r\n".data(using: .utf8)!)
+        body.append("Content-Disposition: form-data; name=\"file\"; filename=\"\(URL(fileURLWithPath: filePath).lastPathComponent)\"\r\n".data(using: .utf8)!)
         body.append("Content-Type: application/octet-stream\r\n\r\n".data(using: .utf8)!)
         body.append(fileData)
         body.append("\r\n".data(using: .utf8)!)
@@ -316,7 +410,6 @@ struct ContentView: View {
         
         request.httpBody = body
         
-        NSLog("Fire: uploadToRapidagator")
         let task = URLSession.shared.dataTask(with: request) { data, response, error in
             if let error = error {
                 completion(.failure(error))
@@ -330,15 +423,8 @@ struct ContentView: View {
             
             do {
                 if let json = try JSONSerialization.jsonObject(with: data, options: []) as? [String: Any],
-                   let response = json["response"] as? [String: Any],
-                   let upload = response["upload"] as? [String: Any],
-                   let uploadId = upload["upload_id"] as? String {
-                    NSLog("Response: " + response.description)
-                    
-                    completion(.success("Checking status..."))
-                    DispatchQueue.global().asyncAfter(deadline: .now() + 5) {
-                        checkUploadStatus(uploadId: uploadId, token: token, completion: completion)
-                    }
+                   let state = json["status"] as? Int, state == 200 {
+                    completion(.success(uploadId))
                 } else {
                     completion(.failure(NSError(domain: "ParseError", code: -1, userInfo: nil)))
                 }
@@ -346,12 +432,65 @@ struct ContentView: View {
                 completion(.failure(error))
             }
         }
+        
         task.resume()
     }
     
+    func performUpload(filePath: String, token: String, uiCompletion: @escaping (Result<String, Error>) -> Void) {
+        NSLog("Performing upload...")
+        //uiCompletion(.success("Performing upload..."))
+        
+        guard let fileData = try? Data(contentsOf: URL(fileURLWithPath: filePath)) else {
+            print("Error: Cannot read file at \(filePath)")
+            return
+        }
+        
+        let fileName = URL(fileURLWithPath: filePath).lastPathComponent
+        let fileSize = fileData.count
+        let fileHash = md5(data: fileData)
+        
+        //uiCompletion(.success("Performing upload...1/2"))
+        initiateUpload(fileName: fileName, fileSize: fileSize, fileHash: fileHash, token: token) { result in
+            switch result {
+            case .success((let uploadId, let url)):
+                if let uploadId = uploadId {
+                    // File needs to be uploaded
+                    //uiCompletion(.success("Performing upload...2/2"))
+                    uploadFile(filePath: filePath, url: url, uploadId: uploadId) { uploadResult in
+                        switch uploadResult {
+                        case .success:
+                            self.checkUploadStatus(uploadId: uploadId, token: token) { checkResult in
+                                switch checkResult {
+                                case .success(let downloadUrl):
+                                    uiCompletion(.success(downloadUrl))
+                                case .failure(let error):
+                                    uiCompletion(.failure(error))
+                                }
+                            }
+                        case .failure(let error):
+                            uiCompletion(.failure(error))
+                        }
+                    }
+                } else {
+                    // File already exists, URL is provided
+                    uiCompletion(.success(url))
+                }
+            case .failure(let error):
+                uiCompletion(.failure(error))
+            }
+        }
+    }
+    
     func checkUploadStatus(uploadId: String, token: String, completion: @escaping (Result<String, Error>) -> Void) {
-        let url = URL(string: "https://rapidgator.net/api/v2/file/upload_info")!
-        var request = URLRequest(url: url)
+        let url = "https://rapidgator.net/api/v2/file/upload_info"
+        
+        guard let requestURL = URL(string: url) else {
+            completion(.failure(NSError(domain: "InvalidURL", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid URL: \(url)"])))
+            return
+        }
+        
+        var request = URLRequest(url: requestURL)
+        
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         
@@ -412,6 +551,18 @@ struct ContentView: View {
         return hash.map { String(format: "%02x", $0) }.joined()
     }
     
+    private func md5(string: String, salt: String = "stevejobs") -> String {
+        let saltedString = salt + string // Concatenate salt and input string
+        guard let data = saltedString.data(using: .utf8) else {
+            return ""
+        }
+        var hash = [UInt8](repeating: 0, count: Int(CC_MD5_DIGEST_LENGTH))
+        data.withUnsafeBytes {
+            _ = CC_MD5($0.baseAddress, CC_LONG(data.count), &hash)
+        }
+        return hash.map { String(format: "%02x", $0) }.joined()
+    }
+    
     func zipFiles(filePaths: [String], completion: @escaping (Result<String, Error>) -> Void) {
         guard !filePaths.isEmpty else {
             completion(.failure(NSError(domain: "NoFiles", code: -1, userInfo: [NSLocalizedDescriptionKey: "No files to zip."])))
@@ -426,7 +577,11 @@ struct ContentView: View {
             .max(by: { $0.count < $1.count }) ?? "archive"
         
         // Ensure the name ends with `.zip`
-        let zipFileName = "\(longestFileName).zip"
+        let zipFileName = md5(string: longestFileName) + ".zip"
+        
+        DispatchQueue.main.async {
+            title = longestFileName // Use the meaningful name as the title
+        }
         
         // Get the temporary directory
         let tempDirectory = fileManager.temporaryDirectory
@@ -460,8 +615,15 @@ struct ContentView: View {
     }
     
     func uploadImage(filePath: String, apiKey: String, completion: @escaping (Result<String, Error>) -> Void) {
-        let url = URL(string: "https://api.imgbb.com/1/upload")!
-        var request = URLRequest(url: url)
+        let url = "https://api.imgbb.com/1/upload"
+        
+        guard let requestURL = URL(string: url) else {
+            completion(.failure(NSError(domain: "InvalidURL", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid URL: \(url)"])))
+            return
+        }
+        
+        var request = URLRequest(url: requestURL)
+        
         request.httpMethod = "POST"
         
         let boundary = UUID().uuidString
@@ -476,9 +638,8 @@ struct ContentView: View {
         body.append("--\(boundary)\r\n".data(using: .utf8)!)
         body.append("Content-Disposition: form-data; name=\"key\"\r\n\r\n".data(using: .utf8)!)
         body.append("\(apiKey)\r\n".data(using: .utf8)!)
-        
         body.append("--\(boundary)\r\n".data(using: .utf8)!)
-        body.append("Content-Disposition: form-data; name=\"image\"; filename=\"image.jpg\"\r\n".data(using: .utf8)!)
+        body.append("Content-Disposition: form-data; name=\"image\"; filename=\"cover.jpg\"\r\n".data(using: .utf8)!)
         body.append("Content-Type: image/jpeg\r\n\r\n".data(using: .utf8)!)
         body.append(imageData)
         body.append("\r\n".data(using: .utf8)!)
@@ -501,6 +662,9 @@ struct ContentView: View {
                 if let json = try JSONSerialization.jsonObject(with: data, options: []) as? [String: Any],
                    let data = json["data"] as? [String: Any],
                    let imageUrl = data["url"] as? String {
+                    
+                    NSLog("data: " + data.description)
+                    
                     completion(.success(imageUrl))
                 } else {
                     completion(.failure(NSError(domain: "ParseError", code: -1, userInfo: nil)))
