@@ -22,7 +22,9 @@ struct ContentView: View {
     @State private var postResult: String? = nil
     
     @State private var showCopyNotification: Bool = false
-
+    @State private var uploadingCover: Bool = false
+    @State private var uploadingFiles: Bool = false
+    
     private let credentials = CredentialsManager.shared
     
     enum ActionType {
@@ -73,13 +75,18 @@ struct ContentView: View {
                     }
                     
                     if coverUploadResult == nil {
-                        Button("Upload Cover") {
-                            performAction(for: .uploadCover(cover)) { result in
-                                switch result {
-                                case .success(let url):
-                                    self.coverUploadResult = url
-                                case .failure(let error):
-                                    print("Error uploading cover: \(error)")
+                        if uploadingCover {
+                            ProgressView()
+                                .padding()
+                        } else{
+                            Button("Upload Cover") {
+                                performAction(for: .uploadCover(cover)) { result in
+                                    switch result {
+                                    case .success(let url):
+                                        self.coverUploadResult = url
+                                    case .failure(let error):
+                                        print("Error uploading cover: \(error)")
+                                    }
                                 }
                             }
                         }
@@ -133,13 +140,18 @@ struct ContentView: View {
                     }
                     
                     if filesZipResult != nil && filesUploadResult == nil {
-                        Button("Upload Zipped File") {
-                            performAction(for: .uploadFile(filesZipResult!)) { result in
-                                switch result {
-                                case .success(let path):
-                                    self.filesUploadResult = path
-                                case .failure(let error):
-                                    print("Error: \(error.localizedDescription)")
+                        if uploadingFiles {
+                            ProgressView()
+                                .padding()
+                        } else{
+                            Button("Upload Zipped File") {
+                                performAction(for: .uploadFile(filesZipResult!)) { result in
+                                    switch result {
+                                    case .success(let path):
+                                        self.filesUploadResult = path
+                                    case .failure(let error):
+                                        print("Error: \(error.localizedDescription)")
+                                    }
                                 }
                             }
                         }
@@ -229,11 +241,14 @@ struct ContentView: View {
     private func performAction(for uploadType: ActionType, uiCompletion: @escaping (Result<String, Error>) -> Void) {
         switch uploadType {
         case .uploadCover(let filePath):
-            uploadImage(filePath: filePath, apiKey: credentials.apiKey) { result in
+            uploadingCover = true
+            uploadImage(filePath: filePath, apiKey: credentials.apiKey) { (result: Result<String, Error>) in
                 DispatchQueue.main.async {
+                    uploadingCover = false
                     uiCompletion(result)
                 }
             }
+            
         case .zipFiles(let filePaths):
             zipFiles(filePaths: filePaths) { result in
                 DispatchQueue.main.async {
@@ -242,16 +257,117 @@ struct ContentView: View {
             }
             
         case .uploadFile(let filePath):
-            //uiCompletion(.success("Authenticating..."))
+            uploadingFiles = true
             authenticate(login: credentials.login, password: credentials.password) { authResult in
-                switch authResult {
-                case .success(let token):
-                    performUpload(filePath: filePath, token: token, uiCompletion: uiCompletion)
-                case .failure(let error):
-                    uiCompletion(.failure(NSError(domain: "Authentication failed", code: -1, userInfo: nil)))
+                DispatchQueue.main.async {
+                    switch authResult {
+                    case .success(let token):
+                        handleFileUpload(filePath: filePath, token: token, uiCompletion: uiCompletion)
+                    case .failure(let error):
+                        uploadingFiles = false
+                        uiCompletion(.failure(error))
+                    }
                 }
             }
         }
+    }
+    
+    private func handleFileUpload(filePath: String, token: String, uiCompletion: @escaping (Result<String, Error>) -> Void) {
+        guard let fileData = try? Data(contentsOf: URL(fileURLWithPath: filePath)) else {
+            uploadingFiles = false
+            uiCompletion(.failure(NSError(domain: "FileError", code: -1, userInfo: [NSLocalizedDescriptionKey: "Cannot read file at \(filePath)"])))
+            return
+        }
+        
+        let fileName = URL(fileURLWithPath: filePath).lastPathComponent
+        let fileSize = fileData.count
+        let fileHash = md5(data: fileData)
+        
+        initiateUpload(fileName: fileName, fileSize: fileSize, fileHash: fileHash, token: token) { result in
+            DispatchQueue.main.async {
+                switch result {
+                case .success((let uploadId, let url)):
+                    if let uploadId = uploadId {
+                        uploadFile(filePath: filePath, url: url, uploadId: uploadId) { uploadResult in
+                            DispatchQueue.main.async {
+                                switch uploadResult {
+                                case .success:
+                                    checkUploadStatus(uploadId: uploadId, token: token, uiCompletion: uiCompletion)
+                                case .failure(let error):
+                                    uploadingFiles = false
+                                    uiCompletion(.failure(error))
+                                }
+                            }
+                        }
+                    } else {
+                        // File already exists
+                        uploadingFiles = false
+                        uiCompletion(.success(url))
+                    }
+                case .failure(let error):
+                    uploadingFiles = false
+                    uiCompletion(.failure(error))
+                }
+            }
+        }
+    }
+    
+    private func checkUploadStatus(uploadId: String, token: String, uiCompletion: @escaping (Result<String, Error>) -> Void) {
+        let url = "https://rapidgator.net/api/v2/file/upload_info"
+        
+        guard let requestURL = URL(string: url) else {
+            uiCompletion(.failure(NSError(domain: "InvalidURL", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid URL: \(url)"])))
+            return
+        }
+        
+        var request = URLRequest(url: requestURL)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["upload_id": uploadId, "token": token], options: [])
+        
+        let task = URLSession.shared.dataTask(with: request) { data, response, error in
+            if let error = error {
+                DispatchQueue.main.async {
+                    uiCompletion(.failure(error))
+                }
+                return
+            }
+            
+            guard let data = data else {
+                DispatchQueue.main.async {
+                    uiCompletion(.failure(NSError(domain: "NoData", code: -1, userInfo: nil)))
+                }
+                return
+            }
+            
+            do {
+                if let json = try JSONSerialization.jsonObject(with: data, options: []) as? [String: Any],
+                   let response = json["response"] as? [String: Any],
+                   let upload = response["upload"] as? [String: Any],
+                   let state = upload["state"] as? Int {
+                    
+                    if state == 2, let file = upload["file"] as? [String: Any], let url = file["url"] as? String {
+                        DispatchQueue.main.async {
+                            uploadingFiles = false
+                            uiCompletion(.success(url))
+                        }
+                    } else {
+                        DispatchQueue.global().asyncAfter(deadline: .now() + 5) {
+                            self.checkUploadStatus(uploadId: uploadId, token: token, uiCompletion: uiCompletion)
+                        }
+                    }
+                } else {
+                    DispatchQueue.main.async {
+                        uiCompletion(.failure(NSError(domain: "ParseError", code: -1, userInfo: nil)))
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    uiCompletion(.failure(error))
+                }
+            }
+        }
+        task.resume()
     }
     
     private func resetData() {
@@ -459,7 +575,7 @@ struct ContentView: View {
                     uploadFile(filePath: filePath, url: url, uploadId: uploadId) { uploadResult in
                         switch uploadResult {
                         case .success:
-                            self.checkUploadStatus(uploadId: uploadId, token: token) { checkResult in
+                            checkUploadStatus(uploadId: uploadId, token: token) { (checkResult: Result<String, Error>) in
                                 switch checkResult {
                                 case .success(let downloadUrl):
                                     uiCompletion(.success(downloadUrl))
@@ -479,68 +595,6 @@ struct ContentView: View {
                 uiCompletion(.failure(error))
             }
         }
-    }
-    
-    func checkUploadStatus(uploadId: String, token: String, completion: @escaping (Result<String, Error>) -> Void) {
-        let url = "https://rapidgator.net/api/v2/file/upload_info"
-        
-        guard let requestURL = URL(string: url) else {
-            completion(.failure(NSError(domain: "InvalidURL", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid URL: \(url)"])))
-            return
-        }
-        
-        var request = URLRequest(url: requestURL)
-        
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        
-        let body = [
-            "upload_id": uploadId,
-            "token": token
-        ]
-        
-        request.httpBody = try? JSONSerialization.data(withJSONObject: body, options: [])
-        
-        NSLog("Fire: checkUploadStatus")
-        let task = URLSession.shared.dataTask(with: request) { data, response, error in
-            if let error = error {
-                completion(.failure(error))
-                return
-            }
-            
-            guard let data = data else {
-                completion(.failure(NSError(domain: "NoData", code: -1, userInfo: nil)))
-                return
-            }
-            
-            do {
-                if let json = try JSONSerialization.jsonObject(with: data, options: []) as? [String: Any],
-                   let response = json["response"] as? [String: Any],
-                   let upload = response["upload"] as? [String: Any],
-                   let state = upload["state"] as? Int {
-                    
-                    NSLog("Response: " + response.description)
-                    
-                    if state == 2 {
-                        if let file = upload["file"] as? [String: Any],
-                           let url = file["url"] as? String {
-                            completion(.success(url))
-                        } else {
-                            completion(.failure(NSError(domain: "NoDownloadURL", code: -1, userInfo: nil)))
-                        }
-                    } else {
-                        DispatchQueue.global().asyncAfter(deadline: .now() + 5) {
-                            checkUploadStatus(uploadId: uploadId, token: token, completion: completion)
-                        }
-                    }
-                } else {
-                    completion(.failure(NSError(domain: "ParseError", code: -1, userInfo: nil)))
-                }
-            } catch {
-                completion(.failure(error))
-            }
-        }
-        task.resume()
     }
     
     private func md5(data: Data) -> String {
